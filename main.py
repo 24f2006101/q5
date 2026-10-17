@@ -1,6 +1,7 @@
 import time
 import uuid
 from typing import Optional
+from fastapi import Request
 
 from fastapi import FastAPI, Header, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,40 +62,47 @@ def create_order(
 
 # ----- 2. Cursor pagination -----
 
-@app.get("/orders")
-def list_orders(
-    limit: int = Query(default=10, ge=1, le=100),
-    cursor: Optional[str] = Query(default=None),
+@app.post("/orders", status_code=201)
+async def create_order(
+    request: Request,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ):
-    # Cursor is simply the ID of the last order returned.
-    # It is opaque to the client: they only need to send it back unchanged.
-    start_id = 1
+    if not idempotency_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Idempotency-Key header is required"
+        )
 
-    if cursor is not None:
-        try:
-            start_id = int(cursor) + 1
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid cursor")
+    # Return the original order if this key was already used.
+    if idempotency_key in idempotency_store:
+        return idempotency_store[idempotency_key]
 
-    end_id = min(start_id + limit - 1, TOTAL_ORDERS)
+    global next_order_number
 
-    items = [
-        {
-            "id": order_id,
-            "item": f"Order {order_id}",
-            "price": 10.0 + order_id,
-        }
-        for order_id in range(start_id, end_id + 1)
-    ]
+    # Accept an empty body, JSON, or form data without causing 422.
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
 
-    next_cursor = None
-    if end_id < TOTAL_ORDERS:
-        next_cursor = str(end_id)
+    if not isinstance(body, dict):
+        body = {}
 
-    return {
-        "items": items,
-        "next_cursor": next_cursor,
+    item = body.get("item", "default-item")
+    quantity = body.get("quantity", 1)
+
+    order = {
+        "id": str(uuid.uuid4()),
+        "order_number": next_order_number,
+        "item": item,
+        "quantity": quantity,
+        "created_at": time.time(),
     }
+
+    next_order_number += 1
+    idempotency_store[idempotency_key] = order
+
+    return order
 
 # ----- 3. Per-client rate limiting -----
 
