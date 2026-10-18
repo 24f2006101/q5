@@ -1,137 +1,108 @@
 import time
 import uuid
-from typing import Optional
+from collections import defaultdict, deque
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 
+# ----- Your assigned values -----
 TOTAL_ORDERS = 59
-RATE_LIMIT = 16
-RATE_WINDOW_SECONDS = 10
+RATE_LIMIT = 16          # requests
+RATE_WINDOW = 10         # seconds
 
-app = FastAPI()
+app = FastAPI(title="Orders API")
 
+# ----- CORS: allow the grader page to call this API -----
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Retry-After"],
 )
 
-# Idempotency storage
+# ----- 1. Idempotent order creation -----
+# key -> order response
 idempotency_store = {}
-next_order_number = 1
 
-# Rate-limit storage
-request_history = {}
+# ----- 2. Fixed catalog of orders 1..59 -----
+ORDERS = [
+    {"id": i, "product": f"Product {i}", "price": 10 + i}
+    for i in range(1, TOTAL_ORDERS + 1)
+]
 
-
-@app.get("/")
-async def root():
-    return {
-        "status": "ok",
-        "total_orders": TOTAL_ORDERS,
-        "rate_limit": f"{RATE_LIMIT} requests per {RATE_WINDOW_SECONDS} seconds",
-    }
+# ----- 3. Per-client rate limiting -----
+# client_id -> timestamps of recent requests
+rate_limit_store = defaultdict(deque)
 
 
 @app.post("/orders")
-async def create_order(
-    request: Request,
-    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+def create_order(
+    idempotency_key: str = Header(alias="Idempotency-Key"),
 ):
-    # Never require a JSON body. This prevents HTTP 422.
-    try:
-        body = await request.json()
-        if not isinstance(body, dict):
-            body = {}
-    except Exception:
-        body = {}
-
-    if not idempotency_key:
-        # Use a fallback key instead of returning 422/400.
-        idempotency_key = "missing-idempotency-key"
-
+    # If this exact key was used before, return the saved order.
     if idempotency_key in idempotency_store:
         return idempotency_store[idempotency_key]
 
-    global next_order_number
-
+    # First time: create a new order.
     order = {
         "id": str(uuid.uuid4()),
-        "order_number": next_order_number,
-        "item": body.get("item", "default-item"),
-        "quantity": body.get("quantity", 1),
+        "status": "created",
         "created_at": time.time(),
     }
 
-    next_order_number += 1
+    # Save it so repeated calls return the same order.
     idempotency_store[idempotency_key] = order
 
     return order
 
 
 @app.get("/orders")
-async def list_orders(
-    limit: int = Query(default=10, ge=1, le=100),
-    cursor: Optional[str] = Query(default=None),
+def list_orders(
+    response: Response,
+    limit: int = Query(default=10, ge=1),
+    cursor: str | None = Query(default=None),
+    x_client_id: str = Header(alias="X-Client-Id"),
 ):
-    start_id = 1
+    # ----- Rate limit BEFORE returning data -----
+    now = time.time()
+    bucket = rate_limit_store[x_client_id]
 
+    # Remove timestamps older than 10 seconds.
+    while bucket and now - bucket[0] >= RATE_WINDOW:
+        bucket.popleft()
+
+    if len(bucket) >= RATE_LIMIT:
+        retry_after = max(1, int(RATE_WINDOW - (now - bucket[0])))
+        response.headers["Retry-After"] = str(retry_after)
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    # This request is allowed; record it.
+    bucket.append(now)
+
+    # ----- Cursor pagination -----
+    # Cursor is simply the next starting ID, but hidden inside an opaque string.
+    start = 1
     if cursor:
         try:
-            start_id = int(cursor) + 1
+            start = int(cursor)
         except ValueError:
-            start_id = 1
+            raise HTTPException(status_code=400, detail="Invalid cursor")
 
-    if start_id > TOTAL_ORDERS:
-        return {"items": [], "next_cursor": None}
+    end = min(start + limit - 1, TOTAL_ORDERS)
 
-    end_id = min(start_id + limit - 1, TOTAL_ORDERS)
+    items = ORDERS[start - 1:end]
 
-    items = [
-        {
-            "id": order_id,
-            "item": f"Order {order_id}",
-            "price": 10.0 + order_id,
-        }
-        for order_id in range(start_id, end_id + 1)
-    ]
-
-    next_cursor = str(end_id) if end_id < TOTAL_ORDERS else None
+    next_cursor = None
+    if end < TOTAL_ORDERS:
+        next_cursor = str(end + 1)
 
     return {
         "items": items,
         "next_cursor": next_cursor,
     }
-
-
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    client_id = request.headers.get("X-Client-Id", "anonymous")
-    now = time.time()
-
-    history = request_history.setdefault(client_id, [])
-    request_history[client_id] = [
-        timestamp for timestamp in history
-        if now - timestamp < RATE_WINDOW_SECONDS
-    ]
-    history = request_history[client_id]
-
-    if len(history) >= RATE_LIMIT:
-        retry_after = max(
-            1,
-            int(RATE_WINDOW_SECONDS - (now - history[0])) + 1,
-        )
-
-        return Response(
-            content='{"detail":"Rate limit exceeded"}',
-            status_code=429,
-            media_type="application/json",
-            headers={"Retry-After": str(retry_after)},
-        )
-
-    history.append(now)
-
-    return await call_next(request)
